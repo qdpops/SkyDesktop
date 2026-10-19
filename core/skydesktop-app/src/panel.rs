@@ -1283,11 +1283,9 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
     // Сколько места занимает содержимое без учёта прокрутки: по нему
     // ограничивается сама прокрутка, чтобы за последней карточкой не было
     // пустоты.
-    let content_h = if pinned {
-        y + state.scroll - viewport_top + 24.0
-    } else {
-        y + state.scroll - top + 24.0
-    };
+    // Под последней карточкой — тот же серый отступ, что над первой: иначе
+    // в настройках белая карточка упиралась в край окна.
+    let content_h = y + state.scroll - viewport_top + 24.0;
 
     // Меню строится последним: оно должно уместиться в окне целиком.
     let menu = state.menu.map(|menu| {
@@ -2442,9 +2440,8 @@ mod screenshots {
         // История уехала ровно на величину прокрутки.
         let (before, after) = (still.cards.history.unwrap(), scrolled.cards.history.unwrap());
         assert_eq!(after.y, before.y - state.scroll);
-        // Последняя строка докручивается до низа окна, но не дальше.
-        let last = scrolled.cards.history_rows.last().unwrap().0;
-        assert!(last.y + last.h <= size.height as f32);
+        // Докрутили до конца — под историей тот же зазор, что над первой карточкой.
+        assert_eq!(size.height as f32 - (after.y + after.h), 24.0);
         // Строка, спрятанная под закреплённой частью, не нажимается.
         let hidden = scrolled.cards.history_rows[0].0;
         assert!(hidden.y < scrolled.viewport_top);
@@ -2453,12 +2450,34 @@ mod screenshots {
     }
 
     #[test]
+    fn settings_keep_a_margin_at_the_bottom() {
+        let mut state = demo();
+        state.page = Page::Settings;
+        let size = PhysicalSize::new(1180, 600);
+        state.scroll = layout_for(size, &state, 1.0).max_scroll();
+        assert!(state.scroll > 0.0, "в низком окне настройки должны листаться");
+        let layout = layout_for(size, &state, 1.0);
+        let bottom = layout.settings.rights.y + layout.settings.rights.h;
+        assert_eq!(size.height as f32 - bottom, 24.0, "под последней карточкой — отступ");
+    }
+
+    #[test]
     #[ignore = "пишет файлы в docs/screenshots"]
     fn scrolled() {
         let mut state = demo();
         long_history(&mut state);
-        state.scroll = 400.0;
+        state.scroll = 10_000.0;
+        let max = layout_for(PhysicalSize::new(1770, 1140), &state, 1.5).max_scroll();
+        state.scroll = max;
         save(&state, "../../core/target/scrolled.png");
+        state.page = Page::Settings;
+        state.scroll = 10_000.0;
+        let fonts = Fonts::load().unwrap();
+        let size = PhysicalSize::new(1180, 600);
+        state.scroll = layout_for(size, &state, 1.0).max_scroll();
+        let mut pixmap = Pixmap::new(size.width, size.height).unwrap();
+        render(&mut pixmap, &fonts, None, &state, size, 1.0);
+        pixmap.save_png(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/settings-bottom.png")).unwrap();
     }
 
     #[test]

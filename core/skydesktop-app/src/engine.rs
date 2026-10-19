@@ -108,6 +108,8 @@ pub enum Request {
     Install,
     /// Скачать и поставить новую версию с GitHub.
     Update,
+    /// Проверить обновления сейчас, не дожидаясь фоновой проверки.
+    CheckUpdate,
 }
 
 /// Что приходит в поток ядра: запрос от интерфейса либо ответ каталога.
@@ -189,6 +191,27 @@ pub fn start(bus: EventBus) -> Engine {
                                         text,
                                     });
                                 }
+                            });
+                        }
+                        last = None;
+                    }
+                    Ok(Message::Ui(Request::CheckUpdate)) => {
+                        if !CHECKING.swap(true, Ordering::Relaxed) {
+                            let bus = bus.clone();
+                            std::thread::spawn(move || {
+                                let text = match check_update() {
+                                    Ok(Some(version)) => format!("Доступна версия {version}"),
+                                    Ok(None) => format!(
+                                        "Установлена последняя версия {}",
+                                        crate::update::current()
+                                    ),
+                                    Err(err) => format!("Не удалось проверить обновления: {err}"),
+                                };
+                                CHECKING.store(false, Ordering::Relaxed);
+                                bus.publish(CoreEvent::Notice {
+                                    level: "info".to_string(),
+                                    text,
+                                });
                             });
                         }
                         last = None;
@@ -539,7 +562,9 @@ fn handle(request: Request) -> Outcome {
         }
         // Обрабатываются в самом цикле: там живёт список отслеживаемых
         // адресов и шина для ответа установщика.
-        Request::WatchPeers(_) | Request::Install | Request::Update => Outcome::Nothing,
+        Request::WatchPeers(_) | Request::Install | Request::Update | Request::CheckUpdate => {
+            Outcome::Nothing
+        }
         Request::SetElevateOnStart(on) => {
             // Пишем именно «N», а не пустую строку: пустое значение ядро
             // считает отсутствием настройки, а отсутствие у нас означает
@@ -665,6 +690,7 @@ fn device_state(directory: &DirectoryStateDto) -> DeviceStateDto {
         installing: INSTALLING.load(Ordering::Relaxed),
         update_version: UPDATE.lock().unwrap().as_ref().map(|r| r.version.clone()),
         updating: UPDATING.load(Ordering::Relaxed),
+        checking_update: CHECKING.load(Ordering::Relaxed),
     }
 }
 
@@ -677,6 +703,19 @@ const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Найденный релиз новее этой сборки.
 static UPDATE: Mutex<Option<crate::update::Release>> = Mutex::new(None);
 static UPDATING: AtomicBool = AtomicBool::new(false);
+/// Идёт проверка по кнопке в настройках.
+static CHECKING: AtomicBool = AtomicBool::new(false);
+
+/// Спрашивает GitHub и запоминает результат; возвращает новую версию, если она есть.
+fn check_update() -> Result<Option<String>, String> {
+    let release = crate::update::latest()?;
+    let version = release.as_ref().map(|r| r.version.clone());
+    if let Some(version) = &version {
+        tracing::info!("доступна версия {version}");
+    }
+    *UPDATE.lock().unwrap() = release;
+    Ok(version)
+}
 
 /// Фоновая проверка обновлений: при старте и затем раз в [`UPDATE_INTERVAL`].
 /// Панель увидит результат в состоянии устройства при следующем опросе.
@@ -684,14 +723,9 @@ fn spawn_update_checker() {
     let _ = std::thread::Builder::new()
         .name("skydesktop-update".to_string())
         .spawn(|| loop {
-            match crate::update::latest() {
-                Ok(Some(release)) => {
-                    tracing::info!("доступна версия {}", release.version);
-                    *UPDATE.lock().unwrap() = Some(release);
-                }
-                Ok(None) => {}
-                // Без сети или при сбое GitHub просто попробуем позже.
-                Err(err) => tracing::warn!("проверка обновлений: {err}"),
+            // Без сети или при сбое GitHub просто попробуем позже.
+            if let Err(err) = check_update() {
+                tracing::warn!("проверка обновлений: {err}");
             }
             std::thread::sleep(UPDATE_INTERVAL);
         });

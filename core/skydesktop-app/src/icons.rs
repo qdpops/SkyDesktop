@@ -57,6 +57,7 @@ icons! {
     disconnect => "box-arrow-right",
     shield => "shield-lock-fill",
     download => "download",
+    refresh => "arrow-clockwise",
 }
 
 /// Рисует значок в квадрате `size` с левым верхним углом в (x, y).

@@ -78,6 +78,8 @@ enum Zone {
     Install,
     /// Кнопка «Обновить» — когда на GitHub есть версия новее.
     Update,
+    /// Значок у номера версии: проверить обновления сейчас.
+    CheckUpdate,
     /// Пункт всплывающего меню поля ввода.
     Menu(Action),
 }
@@ -176,6 +178,7 @@ impl State {
                 installing: false,
                 update_version: None,
                 updating: false,
+                checking_update: false,
             },
             clients: Vec::new(),
             history: history::load(),
@@ -528,6 +531,12 @@ fn click(
             engine.send(Request::SetElevateOnStart(on));
             state.device.elevate_on_start = on;
         }
+        Zone::CheckUpdate => {
+            if !state.device.checking_update {
+                engine.send(Request::CheckUpdate);
+                state.device.checking_update = true;
+            }
+        }
         Zone::Update => {
             if !state.device.updating {
                 engine.send(Request::Update);
@@ -868,6 +877,8 @@ struct Layout {
     install: Option<Hit>,
     /// Кнопка «Обновить» — пока на GitHub есть версия новее.
     update: Option<Hit>,
+    /// Значок проверки обновлений вместе с номером версии.
+    check_update: Hit,
     /// Меню правой кнопки: рамка и пункты, если оно открыто.
     menu: Option<(Hit, Vec<(Hit, Action)>)>,
     /// Высота прокручиваемого содержимого — предел прокрутки.
@@ -956,6 +967,9 @@ impl Layout {
         }
         if self.update.map_or(false, |hit| hit.contains(x, y)) {
             return Zone::Update;
+        }
+        if self.check_update.contains(x, y) {
+            return Zone::CheckUpdate;
         }
         if self.address.contains(x, y) {
             return Zone::Address;
@@ -1339,6 +1353,13 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
                 h: 60.0,
             }
         }),
+        // Строка версии внизу боковой панели: значок и номер.
+        check_update: Hit {
+            x: 14.0,
+            y: height - 106.0 + 70.0,
+            w: 84.0,
+            h: 22.0,
+        },
         menu,
         content_h,
         viewport_top,
@@ -1695,13 +1716,30 @@ fn draw_sidebar(canvas: &mut Canvas, layout: &Layout, logo: Option<&Pixmap>, sta
         false,
         palette::text_muted(),
     );
+    // Версия и значок «проверить обновления» — на одной линии с точками выше.
+    let check = layout.check_update;
+    let busy = state.device.checking_update;
+    let hovered = state.hover == Zone::CheckUpdate;
+    if hovered {
+        canvas.round(check.x, check.y, check.w, check.h, 6.0, palette::hover_fill());
+    }
+    let ink = if busy || hovered {
+        palette::brand()
+    } else {
+        palette::text_faint()
+    };
+    canvas.icon(icons::refresh, 20.0, bottom + 74.0, 13.0, ink);
     canvas.text(
-        concat!("v", env!("CARGO_PKG_VERSION")),
-        22.0,
+        if busy {
+            "Проверяем…"
+        } else {
+            concat!("v", env!("CARGO_PKG_VERSION"))
+        },
+        40.0,
         bottom + 84.0,
         11.5,
         false,
-        palette::text_faint(),
+        ink,
     );
 }
 
@@ -2378,6 +2416,7 @@ mod screenshots {
             installing: false,
             update_version: None,
             updating: false,
+            checking_update: false,
         };
         state.history = [
             ("482915377", "BUH-PC", "17.10.2026, 14:32"),
@@ -2459,6 +2498,38 @@ mod screenshots {
         let layout = layout_for(size, &state, 1.0);
         let bottom = layout.settings.rights.y + layout.settings.rights.h;
         assert_eq!(size.height as f32 - bottom, 24.0, "под последней карточкой — отступ");
+    }
+
+    #[test]
+    fn version_line_checks_for_updates() {
+        let state = demo();
+        let size = PhysicalSize::new(1180, 760);
+        let layout = layout_for(size, &state, 1.0);
+        let hit = layout.check_update;
+        let point = PhysicalPosition::new((hit.x + 10.0) as f64, (hit.y + hit.h / 2.0) as f64);
+        assert_eq!(layout.zone_at(point, 1.0), Zone::CheckUpdate);
+        // Строка версии не налезает на кнопку «Обновить» над ней.
+        let mut state = state;
+        state.device.update_version = Some("9.9.9".to_string());
+        let layout = layout_for(size, &state, 1.0);
+        let update = layout.update.unwrap();
+        assert!(update.y + update.h < layout.check_update.y);
+    }
+
+    #[test]
+    #[ignore = "пишет файлы в docs/screenshots"]
+    fn version_line() {
+        let fonts = Fonts::load().unwrap();
+        let size = PhysicalSize::new(1180, 760);
+        let mut state = demo();
+        for (name, hover, busy) in [("idle", false, false), ("hover", true, false), ("busy", false, true)] {
+            state.hover = if hover { Zone::CheckUpdate } else { Zone::None };
+            state.device.checking_update = busy;
+            let mut pixmap = Pixmap::new(size.width * 2, size.height * 2).unwrap();
+            render(&mut pixmap, &fonts, None, &state, PhysicalSize::new(size.width * 2, size.height * 2), 2.0);
+            let crop = pixmap.clone_rect(tiny_skia::IntRect::from_xywh(0, 1180, 516, 340).unwrap()).unwrap();
+            crop.save_png(format!("{}/../target/version-{name}.png", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        }
     }
 
     #[test]

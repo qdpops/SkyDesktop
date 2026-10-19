@@ -285,6 +285,9 @@ pub struct DeviceStateDto {
     /// Обновление скачивается или ставится.
     #[serde(default)]
     pub updating: bool,
+    /// Идёт проверка обновлений по кнопке.
+    #[serde(default)]
+    pub checking_update: bool,
 }
 
 /// Входящее подключение к этому устройству.

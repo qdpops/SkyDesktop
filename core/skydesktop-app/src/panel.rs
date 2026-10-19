@@ -870,14 +870,17 @@ struct Layout {
     update: Option<Hit>,
     /// Меню правой кнопки: рамка и пункты, если оно открыто.
     menu: Option<(Hit, Vec<(Hit, Action)>)>,
-    /// Высота содержимого страницы — предел прокрутки.
+    /// Высота прокручиваемого содержимого — предел прокрутки.
     content_h: f32,
+    /// Верх прокручиваемой области. На главной над ней закреплены строка
+    /// подключения и «Это рабочее место», в настройках листается всё.
+    viewport_top: f32,
 }
 
 impl Layout {
     /// На сколько содержимое можно увести вверх.
     fn max_scroll(&self) -> f32 {
-        (self.content_h - (self.height - STRIP)).max(0.0)
+        (self.content_h - (self.height - self.viewport_top)).max(0.0)
     }
 }
 
@@ -963,12 +966,18 @@ impl Layout {
         if self.copy_id.contains(x, y) {
             return Zone::CopyId;
         }
+        // Под закреплённую часть строки уезжают при прокрутке — там их не видно,
+        // и нажимать по ним нельзя.
+        let listed = y >= self.viewport_top as f64;
         for (hit, conn_id) in &self.cards.active_rows {
-            if hit.contains(x, y) {
+            if listed && hit.contains(x, y) {
                 return Zone::Disconnect(*conn_id);
             }
         }
         for (connect, forget, index) in &self.cards.history_rows {
+            if !listed {
+                break;
+            }
             if connect.contains(x, y) {
                 return Zone::HistoryConnect(*index);
             }
@@ -1059,8 +1068,11 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
     let content_x = SIDEBAR + PAD;
     let content_w = (width - SIDEBAR - PAD * 2.0).max(360.0);
     // Карточки сдвигаются целиком: прокрутка — это просто смещение начала.
+    // На главной смещается только то, что ниже «Это рабочее место».
     let top = STRIP + 24.0;
-    let mut y = top - state.scroll;
+    let pinned = state.page == Page::Remote;
+    let mut y = if pinned { top } else { top - state.scroll };
+    let mut viewport_top = STRIP;
 
     let mut cards = Cards::default();
     let mut settings = Settings::default();
@@ -1102,6 +1114,10 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
         };
         copy_id = cards.workplace;
         y += cards.workplace.h + CARD_GAP;
+
+        // Отсюда начинается список: он и листается.
+        viewport_top = y;
+        y -= state.scroll;
 
         if !state.clients.is_empty() {
             let rows = state.clients.len() as f32;
@@ -1267,7 +1283,11 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
     // Сколько места занимает содержимое без учёта прокрутки: по нему
     // ограничивается сама прокрутка, чтобы за последней карточкой не было
     // пустоты.
-    let content_h = y + state.scroll - top + 24.0;
+    let content_h = if pinned {
+        y + state.scroll - viewport_top + 24.0
+    } else {
+        y + state.scroll - top + 24.0
+    };
 
     // Меню строится последним: оно должно уместиться в окне целиком.
     let menu = state.menu.map(|menu| {
@@ -1323,6 +1343,7 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
         }),
         menu,
         content_h,
+        viewport_top,
     }
 }
 
@@ -1724,6 +1745,21 @@ fn draw_strip(canvas: &mut Canvas, layout: &Layout, state: &State) {
 }
 
 fn draw_remote(canvas: &mut Canvas, layout: &Layout, state: &State) {
+    // Сначала листаемый список, потом закреплённая часть поверх него: строки,
+    // уехавшие вверх, прячутся под фоном, а не налезают на поле адреса.
+    draw_remote_list(canvas, layout, state);
+    canvas.fill(
+        SIDEBAR,
+        STRIP,
+        layout.width - SIDEBAR,
+        layout.viewport_top - STRIP,
+        palette::canvas(),
+    );
+    draw_remote_pinned(canvas, layout, state);
+}
+
+/// Строка подключения и «Это рабочее место» — не листаются.
+fn draw_remote_pinned(canvas: &mut Canvas, layout: &Layout, state: &State) {
     let cards = &layout.cards;
 
     // --- Строка подключения ---
@@ -1802,6 +1838,11 @@ fn draw_remote(canvas: &mut Canvas, layout: &Layout, state: &State) {
     let mid = cards.workplace.y + cards.workplace.h / 2.0;
     canvas.text(label, start, mid + 6.0, 18.0, false, palette::text_muted());
     canvas.text(&id, start + label_w + 26.0, mid + 11.0, 32.0, true, palette::brand());
+}
+
+/// Активные подключения и история — листаются.
+fn draw_remote_list(canvas: &mut Canvas, layout: &Layout, state: &State) {
+    let cards = &layout.cards;
 
     // --- Активные подключения ---
     if let Some(card) = cards.active {
@@ -2370,6 +2411,54 @@ mod screenshots {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         pixmap.save_png(dir.join(name)).unwrap();
+    }
+
+    /// Длинная история, чтобы было что листать.
+    fn long_history(state: &mut State) {
+        let first = state.history[0].clone();
+        state.history = (0..14)
+            .map(|i| Visit {
+                address: format!("{}", 400000000 + i * 1234567),
+                name: format!("{} {}", first.name, i + 1),
+                when: first.when.clone(),
+            })
+            .collect();
+    }
+
+    #[test]
+    fn workplace_stays_put_while_history_scrolls() {
+        let mut state = demo();
+        long_history(&mut state);
+        let size = PhysicalSize::new(1180, 760);
+        let still = layout_for(size, &state, 1.0);
+        assert!(still.max_scroll() > 0.0, "длинную историю должно быть можно листать");
+
+        state.scroll = still.max_scroll();
+        let scrolled = layout_for(size, &state, 1.0);
+        // Закреплённое — на тех же местах.
+        assert_eq!(scrolled.address.y, still.address.y);
+        assert_eq!(scrolled.cards.workplace.y, still.cards.workplace.y);
+        assert_eq!(scrolled.viewport_top, still.viewport_top);
+        // История уехала ровно на величину прокрутки.
+        let (before, after) = (still.cards.history.unwrap(), scrolled.cards.history.unwrap());
+        assert_eq!(after.y, before.y - state.scroll);
+        // Последняя строка докручивается до низа окна, но не дальше.
+        let last = scrolled.cards.history_rows.last().unwrap().0;
+        assert!(last.y + last.h <= size.height as f32);
+        // Строка, спрятанная под закреплённой частью, не нажимается.
+        let hidden = scrolled.cards.history_rows[0].0;
+        assert!(hidden.y < scrolled.viewport_top);
+        let point = PhysicalPosition::new((hidden.x + hidden.w / 2.0) as f64, (hidden.y + 2.0) as f64);
+        assert_ne!(scrolled.zone_at(point, 1.0), Zone::HistoryConnect(0));
+    }
+
+    #[test]
+    #[ignore = "пишет файлы в docs/screenshots"]
+    fn scrolled() {
+        let mut state = demo();
+        long_history(&mut state);
+        state.scroll = 400.0;
+        save(&state, "../../core/target/scrolled.png");
     }
 
     #[test]

@@ -118,6 +118,10 @@ enum Message {
     Directory(Result<crate::directory::Document, String>),
     /// Ответ сервера связи: кто из отслеживаемых адресов в сети.
     Online(Vec<String>, Vec<String>),
+    /// Фоновая работа закончилась: показать сообщение и сразу выдать
+    /// состояние. Флаг «идёт…» мог успеть вернуться назад между опросами,
+    /// и по ключу сравнения панель об этом не узнала бы.
+    Done(Option<String>),
 }
 
 /// Ручка к потоку ядра.
@@ -180,24 +184,21 @@ pub fn start(bus: EventBus) -> Engine {
                         // Установщик ждёт ответа в окне UAC сколько угодно
                         // долго, поэтому — в своём потоке.
                         if !INSTALLING.swap(true, Ordering::Relaxed) {
-                            let bus = bus.clone();
+                            let tx = fetch_tx.clone();
                             std::thread::spawn(move || {
                                 let result = crate::install::start();
                                 INSTALLING.store(false, Ordering::Relaxed);
-                                if let Err(text) = result {
+                                if let Err(text) = &result {
                                     tracing::warn!("установка: {text}");
-                                    bus.publish(CoreEvent::Notice {
-                                        level: "error".to_string(),
-                                        text,
-                                    });
                                 }
+                                let _ = tx.send(Message::Done(result.err()));
                             });
                         }
                         last = None;
                     }
                     Ok(Message::Ui(Request::CheckUpdate)) => {
                         if !CHECKING.swap(true, Ordering::Relaxed) {
-                            let bus = bus.clone();
+                            let tx = fetch_tx.clone();
                             std::thread::spawn(move || {
                                 let text = match check_update() {
                                     Ok(Some(version)) => format!("Доступна версия {version}"),
@@ -208,10 +209,7 @@ pub fn start(bus: EventBus) -> Engine {
                                     Err(err) => format!("Не удалось проверить обновления: {err}"),
                                 };
                                 CHECKING.store(false, Ordering::Relaxed);
-                                bus.publish(CoreEvent::Notice {
-                                    level: "info".to_string(),
-                                    text,
-                                });
+                                let _ = tx.send(Message::Done(Some(text)));
                             });
                         }
                         last = None;
@@ -220,18 +218,15 @@ pub fn start(bus: EventBus) -> Engine {
                         let release = UPDATE.lock().unwrap().clone();
                         if let Some(release) = release {
                             if !UPDATING.swap(true, Ordering::Relaxed) {
-                                let bus = bus.clone();
+                                let tx = fetch_tx.clone();
                                 std::thread::spawn(move || {
                                     let result = crate::update::download(&release)
                                         .and_then(|exe| crate::update::install(&exe));
                                     UPDATING.store(false, Ordering::Relaxed);
-                                    if let Err(text) = result {
+                                    if let Err(text) = &result {
                                         tracing::warn!("обновление: {text}");
-                                        bus.publish(CoreEvent::Notice {
-                                            level: "error".to_string(),
-                                            text,
-                                        });
                                     }
+                                    let _ = tx.send(Message::Done(result.err()));
                                 });
                             }
                         }
@@ -243,6 +238,15 @@ pub fn start(bus: EventBus) -> Engine {
                             Outcome::Nothing => {}
                         }
                         // Команда могла изменить пароль или список нод.
+                        last = None;
+                    }
+                    Ok(Message::Done(text)) => {
+                        if let Some(text) = text {
+                            bus.publish(CoreEvent::Notice {
+                                level: "info".to_string(),
+                                text,
+                            });
+                        }
                         last = None;
                     }
                     Ok(Message::Online(online, offline)) => {
@@ -481,7 +485,22 @@ fn set_option(key: &str, value: String) {
 }
 
 /// Ключ сравнения состояний — в UI уходят только реальные изменения.
-fn key(state: &DeviceStateDto) -> (String, String, u8, u8, Option<i32>, String, (bool, bool)) {
+///
+/// Поле, которого здесь нет, панель увидит только при смене другого поля:
+/// так «Проверяем…» оставалось навсегда, пока сюда не попали поля обновления.
+#[allow(clippy::type_complexity)]
+fn key(
+    state: &DeviceStateDto,
+) -> (
+    String,
+    String,
+    u8,
+    u8,
+    Option<i32>,
+    String,
+    (bool, bool),
+    (Option<String>, bool, bool),
+) {
     (
         state.id.clone(),
         state.password.clone(),
@@ -494,6 +513,11 @@ fn key(state: &DeviceStateDto) -> (String, String, u8, u8, Option<i32>, String, 
             state.directory.error
         ),
         (state.installed, state.installing),
+        (
+            state.update_version.clone(),
+            state.updating,
+            state.checking_update,
+        ),
     )
 }
 

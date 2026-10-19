@@ -928,6 +928,8 @@ struct Cards {
     active_rows: Vec<(Hit, i32)>,
     history: Option<Hit>,
     history_rows: Vec<(Hit, Hit, usize)>,
+    /// Верх первой строки истории с учётом прокрутки.
+    rows_top: f32,
 }
 
 impl Layout {
@@ -984,7 +986,7 @@ impl Layout {
         // и нажимать по ним нельзя.
         let listed = y >= self.viewport_top as f64;
         for (hit, conn_id) in &self.cards.active_rows {
-            if listed && hit.contains(x, y) {
+            if hit.contains(x, y) {
                 return Zone::Disconnect(*conn_id);
             }
         }
@@ -1087,6 +1089,7 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
     let pinned = state.page == Page::Remote;
     let mut y = if pinned { top } else { top - state.scroll };
     let mut viewport_top = STRIP;
+    let mut scroll = state.scroll;
 
     let mut cards = Cards::default();
     let mut settings = Settings::default();
@@ -1129,10 +1132,7 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
         copy_id = cards.workplace;
         y += cards.workplace.h + CARD_GAP;
 
-        // Отсюда начинается список: он и листается.
-        viewport_top = y;
-        y -= state.scroll;
-
+        // Активные подключения тоже на месте: их немного, и они важнее истории.
         if !state.clients.is_empty() {
             let rows = state.clients.len() as f32;
             let card = Hit {
@@ -1157,15 +1157,22 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
             y += card.h + CARD_GAP;
         }
 
+        // История: заголовок и шапка колонок стоят, листаются только строки.
         let rows = state.history.len().max(1) as f32;
+        viewport_top = y + HEAD_H + TABLE_HEAD_H;
+        // Строк могло стать меньше или окно выросло — дальше конца не уезжаем.
+        scroll = scroll.min((rows * ROW_H + 24.0 - (height - viewport_top)).max(0.0));
+        let rows_top = viewport_top - scroll;
+        cards.rows_top = rows_top;
         let card = Hit {
             x: content_x,
             y,
             w: content_w,
-            h: HEAD_H + TABLE_HEAD_H + rows * ROW_H,
+            // Низ карточки уезжает вместе со строками.
+            h: HEAD_H + TABLE_HEAD_H + rows * ROW_H - scroll,
         };
         for index in 0..state.history.len() {
-            let row_y = y + HEAD_H + TABLE_HEAD_H + index as f32 * ROW_H;
+            let row_y = rows_top + index as f32 * ROW_H;
             let icon_y = row_y + (ROW_H - 30.0) / 2.0;
             cards.history_rows.push((
                 Hit {
@@ -1184,7 +1191,7 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
             ));
         }
         cards.history = Some(card);
-        y += card.h;
+        y = rows_top + rows * ROW_H;
     
     } else {
 
@@ -1299,7 +1306,7 @@ fn layout_for(size: PhysicalSize<u32>, state: &State, scale: f64) -> Layout {
     // пустоты.
     // Под последней карточкой — тот же серый отступ, что над первой: иначе
     // в настройках белая карточка упиралась в край окна.
-    let content_h = y + state.scroll - viewport_top + 24.0;
+    let content_h = y + scroll - viewport_top + 24.0;
 
     // Меню строится последним: оно должно уместиться в окне целиком.
     let menu = state.menu.map(|menu| {
@@ -1781,16 +1788,29 @@ fn draw_strip(canvas: &mut Canvas, layout: &Layout, state: &State) {
 }
 
 fn draw_remote(canvas: &mut Canvas, layout: &Layout, state: &State) {
-    // Сначала листаемый список, потом закреплённая часть поверх него: строки,
-    // уехавшие вверх, прячутся под фоном, а не налезают на поле адреса.
-    draw_remote_list(canvas, layout, state);
-    canvas.fill(
-        SIDEBAR,
-        STRIP,
-        layout.width - SIDEBAR,
-        layout.viewport_top - STRIP,
-        palette::canvas(),
-    );
+    // Сначала строки истории, потом всё закреплённое поверх них: строки,
+    // уехавшие вверх, прячутся под шапкой карточки, а не налезают на неё.
+    draw_history_rows(canvas, layout, state);
+    if let Some(card) = layout.cards.history {
+        // Над карточкой — фон страницы, сама шапка — белая со скруглённым верхом.
+        canvas.fill(
+            SIDEBAR,
+            STRIP,
+            layout.width - SIDEBAR,
+            card.y + CARD_RADIUS - STRIP,
+            palette::canvas(),
+        );
+        canvas.round(card.x, card.y, card.w, CARD_RADIUS * 2.0, CARD_RADIUS, palette::surface());
+        canvas.fill(
+            card.x,
+            card.y + CARD_RADIUS,
+            card.w,
+            layout.viewport_top - card.y - CARD_RADIUS,
+            palette::surface(),
+        );
+        draw_history_head(canvas, card);
+    }
+    draw_active(canvas, layout, state);
     draw_remote_pinned(canvas, layout, state);
 }
 
@@ -1876,8 +1896,8 @@ fn draw_remote_pinned(canvas: &mut Canvas, layout: &Layout, state: &State) {
     canvas.text(&id, start + label_w + 26.0, mid + 11.0, 32.0, true, palette::brand());
 }
 
-/// Активные подключения и история — листаются.
-fn draw_remote_list(canvas: &mut Canvas, layout: &Layout, state: &State) {
+/// Активные подключения — закреплены над историей.
+fn draw_active(canvas: &mut Canvas, layout: &Layout, state: &State) {
     let cards = &layout.cards;
 
     // --- Активные подключения ---
@@ -1926,11 +1946,10 @@ fn draw_remote_list(canvas: &mut Canvas, layout: &Layout, state: &State) {
         }
     }
 
-    // --- История подключений ---
-    let Some(card) = cards.history else {
-        return;
-    };
-    canvas.card(card);
+}
+
+/// Заголовок истории и шапка колонок — не листаются.
+fn draw_history_head(canvas: &mut Canvas, card: Hit) {
     section_head(canvas, card, icons::clock, "История подключений");
 
     let head_y = card.y + HEAD_H;
@@ -1942,12 +1961,21 @@ fn draw_remote_list(canvas: &mut Canvas, layout: &Layout, state: &State) {
     ] {
         canvas.text(title, x, head_y + TABLE_HEAD_H / 2.0 + 4.0, 11.0, true, palette::text_faint());
     }
+}
+
+/// Строки истории — листаются под закреплённой шапкой.
+fn draw_history_rows(canvas: &mut Canvas, layout: &Layout, state: &State) {
+    let cards = &layout.cards;
+    let Some(card) = cards.history else {
+        return;
+    };
+    canvas.card(card);
 
     if state.history.is_empty() {
         canvas.text_center(
             "История пуста — подключитесь к первому устройству",
             card.x + card.w / 2.0,
-            head_y + TABLE_HEAD_H + ROW_H / 2.0 + 5.0,
+            cards.rows_top + ROW_H / 2.0 + 5.0,
             14.0,
             false,
             palette::text_muted(),
@@ -1956,7 +1984,7 @@ fn draw_remote_list(canvas: &mut Canvas, layout: &Layout, state: &State) {
     }
 
     for (index, visit) in state.history.iter().enumerate() {
-        let y = head_y + TABLE_HEAD_H + index as f32 * ROW_H;
+        let y = cards.rows_top + index as f32 * ROW_H;
         let mid = y + ROW_H / 2.0;
         if index > 0 {
             canvas.fill(card.x + 24.0, y, card.w - 48.0, 1.0, palette::divider());
@@ -2476,9 +2504,11 @@ mod screenshots {
         assert_eq!(scrolled.address.y, still.address.y);
         assert_eq!(scrolled.cards.workplace.y, still.cards.workplace.y);
         assert_eq!(scrolled.viewport_top, still.viewport_top);
-        // История уехала ровно на величину прокрутки.
+        // Шапка истории стоит, строки уехали ровно на величину прокрутки.
         let (before, after) = (still.cards.history.unwrap(), scrolled.cards.history.unwrap());
-        assert_eq!(after.y, before.y - state.scroll);
+        assert_eq!(after.y, before.y);
+        assert_eq!(scrolled.cards.rows_top, still.cards.rows_top - state.scroll);
+        assert_eq!(still.viewport_top, before.y + HEAD_H + TABLE_HEAD_H);
         // Докрутили до конца — под историей тот же зазор, что над первой карточкой.
         assert_eq!(size.height as f32 - (after.y + after.h), 24.0);
         // Строка, спрятанная под закреплённой частью, не нажимается.
@@ -2498,6 +2528,21 @@ mod screenshots {
         let layout = layout_for(size, &state, 1.0);
         let bottom = layout.settings.rights.y + layout.settings.rights.h;
         assert_eq!(size.height as f32 - bottom, 24.0, "под последней карточкой — отступ");
+    }
+
+    #[test]
+    fn scroll_never_runs_past_the_end() {
+        let mut state = demo();
+        long_history(&mut state);
+        let size = PhysicalSize::new(1180, 760);
+        state.scroll = 100_000.0;
+        let layout = layout_for(size, &state, 1.0);
+        let card = layout.cards.history.unwrap();
+        assert_eq!(size.height as f32 - (card.y + card.h), 24.0);
+        // Удалили почти всё — список встаёт на место.
+        state.history.truncate(2);
+        let layout = layout_for(size, &state, 1.0);
+        assert_eq!(layout.cards.rows_top, layout.viewport_top);
     }
 
     #[test]
@@ -2541,6 +2586,9 @@ mod screenshots {
         let max = layout_for(PhysicalSize::new(1770, 1140), &state, 1.5).max_scroll();
         state.scroll = max;
         save(&state, "../../core/target/scrolled.png");
+        state.scroll = 130.0;
+        save(&state, "../../core/target/scrolled-mid.png");
+        state.page = Page::Remote;
         state.page = Page::Settings;
         state.scroll = 10_000.0;
         let fonts = Fonts::load().unwrap();

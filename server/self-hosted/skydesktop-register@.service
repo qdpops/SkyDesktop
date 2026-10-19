@@ -1,0 +1,17 @@
+[Unit]
+Description=Регистрация ноды SkyDesktop (%i) в каталоге
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/opt/skydesktop-server/.env
+Environment=DIRECTORY=http://127.0.0.1:8787
+Environment=HOST=lab-rnd.ru
+Environment=REGION=ru
+Environment=ROLE=%i
+ExecStart=/opt/skydesktop-server/register-node.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

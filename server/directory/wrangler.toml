@@ -1,0 +1,17 @@
+name = "skydesktop-directory"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# Список нод. Записи живут с TTL и пропадают сами, когда нода перестаёт
+# слать heartbeat.
+[[kv_namespaces]]
+binding = "NODES"
+id = "замените на id вашего KV namespace"
+
+[vars]
+# Общий публичный ключ пула. Все ноды обязаны нести одну пару ключей —
+# клиент сверяет ключ при подключении к серверу-посреднику.
+POOL_KEY = ""
+
+# Секрет для подписи регистраций задаётся отдельно и в репозиторий не попадает:
+#   wrangler secret put NODE_SECRET

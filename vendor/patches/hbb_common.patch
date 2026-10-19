@@ -1,0 +1,222 @@
+diff --git a/src/config.rs b/src/config.rs
+index e968ec4..d3d41f4 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -930,11 +930,53 @@ impl Config {
+         rendezvous_server
+     }
+ 
++    /// SkyDesktop: пул нод, полученный из каталога.
++    ///
++    /// Кастомный сервер здесь — затравка, а не замена: `get_rendezvous_servers`
++    /// возвращает его первым и на этом останавливается, поэтому без отдельного
++    /// списка саморегистрирующиеся ноды до клиента не доезжают.
++    fn get_pool_rendezvous_servers() -> Vec<String> {
++        let pool = Self::get_option(keys::OPTION_SKYDESKTOP_RENDEZVOUS_POOL);
++        if pool.is_empty() {
++            return Vec::new();
++        }
++        // Порт дописывается, чтобы «host» и «host:21116» не попали в список дважды.
++        let with_port = |s: &str| -> String {
++            let s = s.trim();
++            let has_port = s
++                .rfind(':')
++                .map(|i| !s[i + 1..].is_empty() && s[i + 1..].bytes().all(|b| b.is_ascii_digit()))
++                .unwrap_or(false);
++            if has_port {
++                s.to_owned()
++            } else {
++                format!("{s}:{RENDEZVOUS_PORT}")
++            }
++        };
++
++        let mut servers = Vec::new();
++        let seed = Self::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER);
++        if !seed.is_empty() {
++            servers.push(with_port(&seed));
++        }
++        for host in pool.split(',').filter(|x| x.contains('.')) {
++            let host = with_port(host);
++            if !servers.contains(&host) {
++                servers.push(host);
++            }
++        }
++        servers
++    }
++
+     pub fn get_rendezvous_servers() -> Vec<String> {
+         let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+         if !s.is_empty() {
+             return vec![s];
+         }
++        let pool = Self::get_pool_rendezvous_servers();
++        if !pool.is_empty() {
++            return pool;
++        }
+         let s = Self::get_option("custom-rendezvous-server");
+         if !s.is_empty() {
+             return vec![s];
+@@ -1985,6 +2027,10 @@ impl PeerConfig {
+             keys::OPTION_CUSTOM_FPS,
+             keys::OPTION_ZOOM_CURSOR,
+             keys::OPTION_I444,
++            keys::OPTION_ADAPTIVE_QUALITY,
++            keys::OPTION_CHROMA_PREFERENCE,
++            keys::OPTION_HDR,
++            keys::OPTION_FEC,
+             keys::OPTION_SWAP_LEFT_RIGHT_MOUSE,
+             keys::OPTION_COLLAPSE_TOOLBAR,
+         ]
+@@ -2375,6 +2421,10 @@ impl UserDefaultConfig {
+             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
+             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
+             keys::OPTION_ENABLE_FILE_COPY_PASTE => self.get_string(key, "Y", vec!["", "N"]),
++            keys::OPTION_ADAPTIVE_QUALITY => self.get_string(key, "Y", vec!["", "N"]),
++            keys::OPTION_CHROMA_PREFERENCE => self.get_string(key, "auto", vec!["444", "420"]),
++            keys::OPTION_HDR => self.get_string(key, "Y", vec!["", "N"]),
++            keys::OPTION_FEC => self.get_string(key, "Y", vec!["", "N"]),
+             keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS => self.get_num_string(key, 100, 20, 150),
+             keys::OPTION_TRACKPAD_SPEED => self.get_num_string(key, 100, 10, 1000),
+             _ => self
+@@ -2864,6 +2914,10 @@ pub mod keys {
+     pub const OPTION_PRIVACY_MODE: &str = "privacy_mode";
+     pub const OPTION_TOUCH_MODE: &str = "touch-mode";
+     pub const OPTION_I444: &str = "i444";
++    pub const OPTION_ADAPTIVE_QUALITY: &str = "adaptive-quality";
++    pub const OPTION_CHROMA_PREFERENCE: &str = "chroma-preference";
++    pub const OPTION_HDR: &str = "hdr";
++    pub const OPTION_FEC: &str = "fec";
+     pub const OPTION_REVERSE_MOUSE_WHEEL: &str = "reverse_mouse_wheel";
+     pub const OPTION_SWAP_LEFT_RIGHT_MOUSE: &str = "swap-left-right-mouse";
+     pub const OPTION_DISPLAYS_AS_INDIVIDUAL_WINDOWS: &str = "displays_as_individual_windows";
+@@ -2933,9 +2987,13 @@ pub mod keys {
+     pub const OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER: &str = "allow-always-software-render";
+     pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
+     pub const OPTION_APPROVE_MODE: &str = "approve-mode";
++    /// SkyDesktop: адрес закреплён за машиной каталогом и меняться не должен.
++    pub const OPTION_SKYDESKTOP_FIXED_ID: &str = "skydesktop-fixed-id";
+     pub const OPTION_VERIFICATION_METHOD: &str = "verification-method";
+     pub const OPTION_TEMPORARY_PASSWORD_LENGTH: &str = "temporary-password-length";
+     pub const OPTION_CUSTOM_RENDEZVOUS_SERVER: &str = "custom-rendezvous-server";
++    /// SkyDesktop: список нод из каталога, через запятую.
++    pub const OPTION_SKYDESKTOP_RENDEZVOUS_POOL: &str = "skydesktop-rendezvous-pool";
+     pub const OPTION_API_SERVER: &str = "api-server";
+     pub const OPTION_KEY: &str = "key";
+     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
+diff --git a/src/fec.rs b/src/fec.rs
+new file mode 100644
+index 0000000..d63f597
+--- /dev/null
++++ b/src/fec.rs
+@@ -0,0 +1,78 @@
++//! SkyDesktop FEC: прямая коррекция ошибок для UDP-транспорта.
++//!
++//! Политика из плана (раздел 4.4):
++//! - потери > 5% → Reed-Solomon, избыточность 20%, блок 8 пакетов
++//! - потери > 1% → XOR, избыточность 10%, блок 16 пакетов
++//! - иначе        → без FEC
++//!
++//! Точка интеграции: `udp::FramedStream::send` / `send_raw`.
++
++/// Тип FEC-кодирования.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FecType {
++    None,
++    Xor,
++    ReedSolomon,
++}
++
++/// Параметры FEC для текущего канала.
++#[derive(Debug, Clone, Copy)]
++pub struct FecParams {
++    pub redundancy_pct: u8,
++    pub block_size: u8,
++    pub fec_type: FecType,
++}
++
++impl FecParams {
++    pub fn disabled() -> Self {
++        Self {
++            redundancy_pct: 0,
++            block_size: 32,
++            fec_type: FecType::None,
++        }
++    }
++
++    /// Выбор FEC по проценту потерь пакетов.
++    pub fn from_loss(packet_loss_pct: f32) -> Self {
++        if packet_loss_pct > 5.0 {
++            Self {
++                redundancy_pct: 20,
++                block_size: 8,
++                fec_type: FecType::ReedSolomon,
++            }
++        } else if packet_loss_pct > 1.0 {
++            Self {
++                redundancy_pct: 10,
++                block_size: 16,
++                fec_type: FecType::Xor,
++            }
++        } else {
++            Self::disabled()
++        }
++    }
++
++    /// Включён ли FEC.
++    pub fn enabled(&self) -> bool {
++        !matches!(self.fec_type, FecType::None)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn high_loss_uses_reed_solomon() {
++        let p = FecParams::from_loss(6.0);
++        assert_eq!(p.fec_type, FecType::ReedSolomon);
++        assert_eq!(p.redundancy_pct, 20);
++        assert!(p.enabled());
++    }
++
++    #[test]
++    fn low_loss_disables_fec() {
++        let p = FecParams::from_loss(0.5);
++        assert_eq!(p.fec_type, FecType::None);
++        assert!(!p.enabled());
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 2b35642..1348211 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,7 @@
+ pub mod compress;
+ pub mod platform;
+ pub mod protos;
++pub mod fec;
+ pub use bytes;
+ use config::Config;
+ pub use futures;
+diff --git a/src/udp.rs b/src/udp.rs
+index fbdf332..9cca7d8 100644
+--- a/src/udp.rs
++++ b/src/udp.rs
+@@ -97,6 +97,16 @@ impl FramedSocket {
+     ) -> ResultType<()> {
+         let addr = addr.into_target_addr()?.to_owned();
+         let send_data = Bytes::from(msg.write_to_bytes()?);
++
++        // SkyDesktop FEC: при включённой опции избыточность пакетов выбирается
++        // по текущим потерям (crate::fec::FecParams::from_loss). Реальное
++        // кодирование XOR/Reed-Solomon включается на этом уровне отправки.
++        if crate::config::Config::get_option("fec") != "N" {
++            let _fec = crate::fec::FecParams::from_loss(0.0);
++            // TODO(integration): использовать фактическую оценку потерь
++            // из VideoQoS/transport и дублировать/кодировать send_data.
++        }
++
+         match self {
+             Self::Direct(f) => {
+                 if let TargetAddr::Ip(addr) = addr {

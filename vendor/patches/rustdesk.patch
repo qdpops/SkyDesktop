@@ -1,0 +1,443 @@
+diff --git a/libs/scrap/src/common/codec.rs b/libs/scrap/src/common/codec.rs
+index 9b072e1..70c401d 100644
+--- a/libs/scrap/src/common/codec.rs
++++ b/libs/scrap/src/common/codec.rs
+@@ -328,6 +328,41 @@ impl Encoder {
+         ENCODE_CODEC_FORMAT.lock().unwrap().clone()
+     }
+ 
++    /// SkyDesktop: принудительная установка кодека по решению адаптивного
++    /// контроллера качества. Вызывается из `server::video_service` до того,
++    /// как видеослужба запомнит текущий формат, иначе проверка «формат
++    /// сменился» перезапускала бы кодировщик на каждом кадре.
++    ///
++    /// Решение применяется, только если пир умеет декодировать этот формат:
++    /// иначе картинки просто не будет.
++    pub fn set_adaptive_codec(format: CodecFormat) {
++        if !Self::peer_can_decode(&format) {
++            log::debug!("SkyDesktop adaptive codec {format:?} не поддержан пиром, оставляем прежний");
++            return;
++        }
++        let mut current = ENCODE_CODEC_FORMAT.lock().unwrap();
++        if *current != format {
++            log::info!("SkyDesktop adaptive codec: {:?} -> {:?}", *current, format);
++            *current = format;
++        }
++    }
++
++    /// SkyDesktop: умеет ли подключённый пир декодировать данный формат.
++    pub fn peer_can_decode(format: &CodecFormat) -> bool {
++        let decodings = PEER_DECODINGS.lock().unwrap();
++        if decodings.is_empty() {
++            return false;
++        }
++        match format {
++            CodecFormat::VP8 => decodings.iter().all(|d| d.1.ability_vp8 > 0),
++            CodecFormat::VP9 => decodings.iter().all(|d| d.1.ability_vp9 > 0),
++            CodecFormat::AV1 => decodings.iter().all(|d| d.1.ability_av1 > 0),
++            CodecFormat::H264 => decodings.iter().all(|d| d.1.ability_h264 > 0),
++            CodecFormat::H265 => decodings.iter().all(|d| d.1.ability_h265 > 0),
++            _ => false,
++        }
++    }
++
+     pub fn supported_encoding() -> SupportedEncoding {
+         #[allow(unused_mut)]
+         let mut encoding = SupportedEncoding {
+diff --git a/src/lib.rs b/src/lib.rs
+index 20d5d6a..bc98663 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,7 +11,8 @@ pub use platform::{
+ mod server;
+ #[cfg(not(any(target_os = "ios")))]
+ pub use self::server::*;
+-mod client;
++// SkyDesktop: клиентская часть нужна собственному вьюеру.
++pub mod client;
+ mod lan;
+ #[cfg(not(any(target_os = "ios")))]
+ mod rendezvous_mediator;
+@@ -19,6 +20,7 @@ mod rendezvous_mediator;
+ pub use self::rendezvous_mediator::*;
+ /// cbindgen:ignore
+ pub mod common;
++mod skydesktop_quality;
+ #[cfg(not(any(target_os = "ios")))]
+ pub mod ipc;
+ #[cfg(not(any(
+@@ -55,9 +57,10 @@ mod whiteboard;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ mod updater;
+ 
+-mod ui_cm_interface;
+-mod ui_interface;
+-mod ui_session_interface;
++// SkyDesktop: интерфейсы ядра используются внешней оболочкой SkyDesktop.
++pub mod ui_cm_interface;
++pub mod ui_interface;
++pub mod ui_session_interface;
+ 
+ mod hbbs_http;
+ 
+diff --git a/src/rendezvous_mediator.rs b/src/rendezvous_mediator.rs
+index 21a7e23..2888845 100644
+--- a/src/rendezvous_mediator.rs
++++ b/src/rendezvous_mediator.rs
+@@ -778,7 +778,19 @@ impl RendezvousMediator {
+             if solving.is_empty() || *solving == self.host {
+                 log::info!("UUID_MISMATCH received from {}", self.host);
+                 Config::set_key_confirmed(false);
+-                Config::update_id();
++                // SkyDesktop: адрес выдан каталогом и закреплён за железом.
++                // Придумывать новый нельзя — записанный у пользователя адрес
++                // перестал бы работать. Причину показывает интерфейс, а
++                // расчистить занятую запись должен сервер.
++                if Config::get_option(OPTION_SKYDESKTOP_FIXED_ID) == "Y" {
++                    log::warn!(
++                        "адрес {} занят другой машиной на {}; он закреплён каталогом и не меняется",
++                        Config::get_id(),
++                        self.host
++                    );
++                } else {
++                    Config::update_id();
++                }
+                 *solving = self.host.clone();
+             } else {
+                 return Ok(());
+diff --git a/src/server/video_qos.rs b/src/server/video_qos.rs
+index b02f6ad..59c5cea 100644
+--- a/src/server/video_qos.rs
++++ b/src/server/video_qos.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::skydesktop_quality::{AdaptiveQualityController, ChannelMetrics, QualityDecision};
+ use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
+ use std::{
+     collections::VecDeque,
+@@ -111,6 +112,10 @@ pub struct VideoQoS {
+     adjust_ratio_instant: Instant,
+     abr_config: bool,
+     new_user_instant: Instant,
++    // SkyDesktop: адаптивное качество (bandwidth/loss/jitter + delay)
++    adaptive: bool,
++    network: ChannelMetrics,
++    adaptive_decision: Option<QualityDecision>,
+ }
+ 
+ impl Default for VideoQoS {
+@@ -124,6 +129,9 @@ impl Default for VideoQoS {
+             adjust_ratio_instant: Instant::now(),
+             abr_config: true,
+             new_user_instant: Instant::now(),
++            adaptive: true,
++            network: ChannelMetrics::new(100.0, 20.0, 0.0, 5.0),
++            adaptive_decision: None,
+         }
+     }
+ }
+@@ -186,9 +194,23 @@ impl VideoQoS {
+     pub fn on_connection_open(&mut self, id: i32) {
+         self.users.insert(id, UserData::default());
+         self.abr_config = Config::get_option("enable-abr") != "N";
++        // SkyDesktop: автоадаптация качества по каналу (по умолчанию включена)
++        self.adaptive = Config::get_option("adaptive-quality") != "N";
+         self.new_user_instant = Instant::now();
+     }
+ 
++    /// SkyDesktop: обновить сетевые метрики (потери, полоса, джиттер).
++    /// Вызывается из transport-слоя вместе с `user_network_delay`.
++    pub fn update_network_stats(&mut self, packet_loss_pct: f32, bandwidth_mbps: f32, jitter_ms: f32) {
++        self.network = ChannelMetrics::new(bandwidth_mbps, self.network.latency_ms, packet_loss_pct, jitter_ms);
++    }
++
++    /// SkyDesktop: последнее решение адаптивного контроллера.
++    /// Используется при создании/пересоздании энкодера (выбор кодека, цветности, HDR, FEC).
++    pub fn adaptive_decision(&self) -> Option<&QualityDecision> {
++        self.adaptive_decision.as_ref()
++    }
++
+     // Clean up user session
+     pub fn on_connection_close(&mut self, id: i32) {
+         self.users.remove(&id);
+@@ -321,6 +343,22 @@ impl VideoQoS {
+                 user.delay.quick_increase_fps_count = 0;
+             }
+ 
++            // SkyDesktop: адаптивное управление качеством.
++            // Учитывает не только задержку, но и полосу, потери и джиттер:
++            // отличный канал → максимум качества, слабый → сжатие.
++            if self.adaptive {
++                let metrics = ChannelMetrics::new(
++                    self.network.bandwidth_mbps,
++                    avg_delay as f32,
++                    self.network.packet_loss_pct,
++                    self.network.jitter_ms,
++                );
++                let decision = AdaptiveQualityController::new(metrics).optimize();
++                fps = decision.fps.clamp(MIN_FPS, highest_fps);
++                self.ratio = decision.target_ratio();
++                self.adaptive_decision = Some(decision);
++            }
++
+             fps = fps.clamp(MIN_FPS, highest_fps);
+             // first network delay message
+             adjust_ratio = user.delay.fps.is_none();
+diff --git a/src/server/video_service.rs b/src/server/video_service.rs
+index 9d97b1c..d0bb659 100644
+--- a/src/server/video_service.rs
++++ b/src/server/video_service.rs
+@@ -688,7 +688,7 @@ fn run(vs: VideoService) -> ResultType<()> {
+             log::info!("switch due to portable service running changed");
+             bail!("SWITCH");
+         }
+-        if Encoder::use_i444(&encoder_cfg) != use_i444 {
++        if adaptive_use_i444(&encoder_cfg) != use_i444 {
+             log::info!("switch due to i444 changed");
+             bail!("SWITCH");
+         }
+@@ -955,13 +955,47 @@ fn setup_encoder(
+         source,
+     );
+     Encoder::set_fallback(&encoder_cfg);
++
++    // Must run before negotiated_codec() is read below: otherwise the format we
++    // remember differs from the current one and the service restarts every frame.
++    if let Some(decision) = adaptive_decision() {
++        let codec = match decision.codec {
++            crate::skydesktop_quality::SkyCodec::AV1 => CodecFormat::AV1,
++            crate::skydesktop_quality::SkyCodec::H265 => CodecFormat::H265,
++            crate::skydesktop_quality::SkyCodec::H264 => CodecFormat::H264,
++        };
++        Encoder::set_adaptive_codec(codec);
++    }
++
+     let codec_format = Encoder::negotiated_codec();
+     let recorder = get_recorder(record_incoming, display_idx, source == VideoSource::Camera);
+-    let use_i444 = Encoder::use_i444(&encoder_cfg);
++    let use_i444 = adaptive_use_i444(&encoder_cfg);
++
+     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
+     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
+ }
+ 
++fn adaptive_decision() -> Option<crate::skydesktop_quality::QualityDecision> {
++    if Config::get_option("adaptive-quality") == "N" {
++        return None;
++    }
++    VIDEO_QOS.lock().unwrap().adaptive_decision().cloned()
++}
++
++/// Both the encoder setup and the "should we rebuild the encoder" check must
++/// derive i444 the same way, otherwise they disagree forever and the video
++/// service restarts on every frame. i444 also stays off unless the peer
++/// negotiated it — forcing it would leave the peer with no image at all.
++fn adaptive_use_i444(encoder_cfg: &EncoderCfg) -> bool {
++    let negotiated = Encoder::use_i444(encoder_cfg);
++    match adaptive_decision() {
++        Some(decision) => {
++            negotiated && matches!(decision.chroma, crate::skydesktop_quality::SkyChroma::I444)
++        }
++        None => negotiated,
++    }
++}
++
+ fn get_encoder_config(
+     c: &CapturerInfo,
+     _name: String,
+diff --git a/src/skydesktop_quality.rs b/src/skydesktop_quality.rs
+new file mode 100644
+index 0000000..0062037
+--- /dev/null
++++ b/src/skydesktop_quality.rs
+@@ -0,0 +1,190 @@
++//! SkyDesktop: адаптивный контроллер качества для RustDesk.
++//!
++//! Расширяет штатный `server::video_qos` (регулировка только по задержке)
++//! полноценной адаптацией: классификация канала по bandwidth/latency/loss/jitter,
++//! выбор кодека, цветности, битрейта, FPS, HDR и FEC.
++//!
++//! Порядок применения решения — в `server::video_qos::VideoQoS`:
++//! - `QualityDecision::target_ratio()` → `VideoQoS::ratio` (через `set_quality` энкодера)
++//! - `QualityDecision::fps`          → `VideoQoS::fps`
++//! - кодек/цветность/HDR/FEC        → передаются в encoder/транспорт (см. комментарии в video_qos.rs)
++
++/// Метрики канала в реальном времени.
++#[derive(Debug, Clone, Copy)]
++pub struct ChannelMetrics {
++    /// Пропускная способность, Мбит/с.
++    pub bandwidth_mbps: f32,
++    /// Задержка, мс.
++    pub latency_ms: f32,
++    /// Потери пакетов, %.
++    pub packet_loss_pct: f32,
++    /// Джиттер, мс.
++    pub jitter_ms: f32,
++}
++
++/// Уровень качества канала.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ChannelLevel {
++    Excellent,
++    Good,
++    Medium,
++    Poor,
++}
++
++impl ChannelMetrics {
++    pub fn new(bandwidth_mbps: f32, latency_ms: f32, packet_loss_pct: f32, jitter_ms: f32) -> Self {
++        Self {
++            bandwidth_mbps,
++            latency_ms,
++            packet_loss_pct,
++            jitter_ms,
++        }
++    }
++
++    pub fn level(&self) -> ChannelLevel {
++        if self.latency_ms < 20.0 && self.packet_loss_pct < 0.5 && self.bandwidth_mbps > 50.0 {
++            ChannelLevel::Excellent
++        } else if self.latency_ms < 40.0 && self.packet_loss_pct < 2.0 && self.bandwidth_mbps > 15.0 {
++            ChannelLevel::Good
++        } else if self.latency_ms < 80.0 && self.packet_loss_pct < 5.0 && self.bandwidth_mbps > 5.0 {
++            ChannelLevel::Medium
++        } else {
++            ChannelLevel::Poor
++        }
++    }
++}
++
++/// Кодек, выбираемый адаптивным контроллером.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SkyCodec {
++    AV1,
++    H265,
++    H264,
++}
++
++/// Цветовая субдискретизация.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SkyChroma {
++    I444,
++    I420,
++}
++
++/// Решение адаптивного контроллера.
++#[derive(Debug, Clone)]
++pub struct QualityDecision {
++    pub codec: SkyCodec,
++    pub chroma: SkyChroma,
++    pub bitrate_mbps: u32,
++    pub fps: u32,
++    pub hdr: bool,
++    pub fec: bool,
++}
++
++impl QualityDecision {
++    /// Маппинг битрейта на «ratio» RustDesk (`scrap::codec`):
++    /// BR_BEST=1.5, BR_BALANCED=0.67, BR_SPEED=0.5, BR_MIN_HIGH_RESOLUTION=0.1.
++    /// 120 Мбит/с принято за эталонный максимум (ratio = 1.0).
++    pub fn target_ratio(&self) -> f32 {
++        (self.bitrate_mbps as f32 / 120.0).clamp(0.1, 1.5)
++    }
++}
++
++/// Адаптивный контроллер качества (план 4.2).
++pub struct AdaptiveQualityController {
++    metrics: ChannelMetrics,
++}
++
++impl AdaptiveQualityController {
++    pub fn new(metrics: ChannelMetrics) -> Self {
++        Self { metrics }
++    }
++
++    pub fn update_metrics(&mut self, metrics: ChannelMetrics) {
++        self.metrics = metrics;
++    }
++
++    pub fn metrics(&self) -> ChannelMetrics {
++        self.metrics
++    }
++
++    /// Отличный канал — максимальное качество, слабый — сжатие.
++    pub fn optimize(&self) -> QualityDecision {
++        let m = &self.metrics;
++        match self.metrics.level() {
++            ChannelLevel::Excellent => QualityDecision {
++                codec: SkyCodec::AV1,
++                chroma: SkyChroma::I444,
++                bitrate_mbps: (m.bandwidth_mbps * 0.9).clamp(60.0, 200.0) as u32,
++                fps: 60,
++                hdr: true,
++                fec: false,
++            },
++            ChannelLevel::Good => QualityDecision {
++                codec: SkyCodec::H265,
++                chroma: SkyChroma::I420,
++                bitrate_mbps: (m.bandwidth_mbps * 0.7).clamp(15.0, 80.0) as u32,
++                fps: 45,
++                hdr: true,
++                fec: true,
++            },
++            ChannelLevel::Medium => QualityDecision {
++                codec: SkyCodec::H265,
++                chroma: SkyChroma::I420,
++                bitrate_mbps: (m.bandwidth_mbps * 0.6).clamp(5.0, 30.0) as u32,
++                fps: 30,
++                hdr: false,
++                fec: true,
++            },
++            ChannelLevel::Poor => QualityDecision {
++                codec: SkyCodec::H264,
++                chroma: SkyChroma::I420,
++                bitrate_mbps: (m.bandwidth_mbps * 0.5).clamp(2.0, 10.0) as u32,
++                fps: 24,
++                hdr: false,
++                fec: true,
++            },
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn metrics_for(level: ChannelLevel) -> ChannelMetrics {
++        match level {
++            ChannelLevel::Excellent => ChannelMetrics::new(480.0, 8.0, 0.1, 2.0),
++            ChannelLevel::Good => ChannelMetrics::new(60.0, 22.0, 0.7, 5.0),
++            ChannelLevel::Medium => ChannelMetrics::new(14.0, 48.0, 2.4, 13.0),
++            ChannelLevel::Poor => ChannelMetrics::new(4.5, 96.0, 6.8, 29.0),
++        }
++    }
++
++    #[test]
++    fn excellent_channel_uses_max_quality() {
++        let d = AdaptiveQualityController::new(metrics_for(ChannelLevel::Excellent)).optimize();
++        assert_eq!(d.codec, SkyCodec::AV1);
++        assert_eq!(d.chroma, SkyChroma::I444);
++        assert_eq!(d.fps, 60);
++        assert!(d.hdr);
++        assert!(!d.fec);
++    }
++
++    #[test]
++    fn poor_channel_compresses() {
++        let d = AdaptiveQualityController::new(metrics_for(ChannelLevel::Poor)).optimize();
++        assert_eq!(d.codec, SkyCodec::H264);
++        assert_eq!(d.chroma, SkyChroma::I420);
++        assert!(d.fps <= 24);
++        assert!(d.bitrate_mbps <= 10);
++        assert!(d.fec);
++    }
++
++    #[test]
++    fn ratio_mapping_matches_rustdesk_constants() {
++        let d = AdaptiveQualityController::new(metrics_for(ChannelLevel::Excellent)).optimize();
++        assert!((d.target_ratio() - 1.5).abs() < f32::EPSILON);
++        let d = AdaptiveQualityController::new(metrics_for(ChannelLevel::Poor)).optimize();
++        assert!(d.target_ratio() >= 0.1);
++    }
++}

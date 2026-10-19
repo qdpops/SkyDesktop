@@ -1,0 +1,14 @@
+# Сборка
+/core/target/
+
+# Ядро RustDesk скачивается scripts/fetch-rustdesk.sh, правки — в vendor/patches
+/vendor/rustdesk/
+
+# vcpkg ставится локально, см. README
+/vcpkg/
+
+# Рабочие заметки
+/План.txt
+
+*.log
+/core/Cargo.lock.pre-rustdesk.bak

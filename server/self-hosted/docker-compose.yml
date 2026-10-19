@@ -1,0 +1,40 @@
+# Серверная часть SkyDesktop: сервер связи (hbbs) и ретранслятор (hbbr).
+#
+# host-сеть выбрана из-за UDP-регистрации и пробивки NAT: в bridge-режиме
+# ядро видит адреса контейнера, а не клиента.
+services:
+  hbbs:
+    image: rustdesk/rustdesk-server:latest
+    container_name: skydesktop-hbbs
+    command: hbbs -r lab-rnd.ru:21117
+    network_mode: host
+    volumes:
+      - ./data:/root
+    restart: unless-stopped
+
+  hbbr:
+    image: rustdesk/rustdesk-server:latest
+    container_name: skydesktop-hbbr
+    command: hbbr
+    network_mode: host
+    volumes:
+      - ./data:/root
+    restart: unless-stopped
+
+  directory:
+    image: node:20-alpine
+    container_name: skydesktop-directory
+    command: node /srv/server.mjs
+    environment:
+      NODE_SECRET: ${NODE_SECRET}
+      POOL_KEY: ${POOL_KEY}
+      PORT: "8787"
+      HOST: "0.0.0.0"
+      DATA_DIR: /data
+    volumes:
+      - ./directory:/srv:ro
+      # Выданные адреса: без этого тома они потерялись бы при перезапуске.
+      - ./data/directory:/data
+    ports:
+      - "8787:8787"
+    restart: unless-stopped

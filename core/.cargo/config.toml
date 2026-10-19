@@ -1,0 +1,9 @@
+# SkyDesktop линкует ядро RustDesk, а его C-зависимости (libvpx, opus, libyuv,
+# aom) собраны vcpkg-триплетом x64-windows-static. Значит и Rust-код должен
+# использовать статический CRT — иначе линковка разъедется.
+# Флаги повторяют vendor/rustdesk/.cargo/config.toml.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
+
+[net]
+git-fetch-with-cli = true

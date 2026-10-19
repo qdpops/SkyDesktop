@@ -1,0 +1,11 @@
+[package]
+name = "skydesktop-core"
+version = "0.1.0"
+edition = "2021"
+description = "Ядро SkyDesktop: адаптивное качество, кодеки, сетевые оптимизации (по мотивам RustDesk)"
+
+[lib]
+name = "skydesktop_core"
+path = "src/lib.rs"
+
+[dependencies]

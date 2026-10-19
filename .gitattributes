@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+# Патчи накладываются на исходники RustDesk с LF — переводы строк не трогаем.
+*.patch -text
+*.png binary
+*.ttf binary
+*.ico binary
